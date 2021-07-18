@@ -45,14 +45,17 @@ typedef struct modem_dte modem_dte_t;
 #define MODEM_MAX_OPERATOR_LENGTH (32) /*!< Max Operator Name Length */
 #define MODEM_IMEI_LENGTH (15)         /*!< IMEI Number Length */
 #define MODEM_IMSI_LENGTH (15)         /*!< IMSI Number Length */
+#define MODEM_ICCID_LENGTH (25)         /*!< IMSI Number Length */
+#define MODEM_GPS_LENGTH (50)         /*!< IMSI Number Length */
 
 /**
  * @brief Specific Timeout Constraint, Unit: millisecond
  *
  */
+#define MODEM_COMMAND_TIMEOUT_GET_GPS (15000)
 #define MODEM_COMMAND_TIMEOUT_DEFAULT (500)      /*!< Default timeout value for most commands */
 #define MODEM_COMMAND_TIMEOUT_OPERATOR (75000)   /*!< Timeout value for getting operator status */
-#define MODEM_COMMAND_TIMEOUT_MODE_CHANGE (5000) /*!< Timeout value for changing working mode */
+#define MODEM_COMMAND_TIMEOUT_MODE_CHANGE (9000) /*!< Timeout value for changing working mode */
 #define MODEM_COMMAND_TIMEOUT_HANG_UP (90000)    /*!< Timeout value for hang up */
 #define MODEM_COMMAND_TIMEOUT_POWEROFF (1000)    /*!< Timeout value for power down */
 
@@ -73,6 +76,8 @@ typedef enum {
 struct modem_dce {
     char imei[MODEM_IMEI_LENGTH + 1];                                                 /*!< IMEI number */
     char imsi[MODEM_IMSI_LENGTH + 1];                                                 /*!< IMSI number */
+    char iccid[MODEM_ICCID_LENGTH + 1];                                                 /*!< IMSI number */
+    char location[MODEM_GPS_LENGTH + 1];
     char name[MODEM_MAX_NAME_LENGTH];                                                 /*!< Module name */
     char oper[MODEM_MAX_OPERATOR_LENGTH];                                             /*!< Operator name */
     uint8_t act;                                                                      /*!< Access technology */

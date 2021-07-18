@@ -18,14 +18,28 @@
 #include "sim800.h"
 #include "bg96.h"
 #include "sim7600.h"
+#include "leds.h"
+#include "inputio.h"
+#include "flow_meter.h"
+#include "param.h"
+#include "lwip/dns.h"
+#include "mydns.h"
+#include "nvs_flash.h"
+#include "esp_ota_ops.h"
+#include "cJSON.h"
+#include "hex.h"
+#include "global_variable.h"
 
-#define BROKER_URL "mqtt://mqtt.eclipse.org"
 
 static const char *TAG = "pppos_example";
-static EventGroupHandle_t event_group = NULL;
-static const int CONNECT_BIT = BIT0;
-static const int STOP_BIT = BIT1;
-static const int GOT_DATA_BIT = BIT2;
+EventGroupHandle_t event_group = NULL;
+const int CONNECT_BIT = BIT0;
+const int STOP_BIT = BIT1;
+const int GOT_DATA_BIT = BIT2;
+const int DATA_REPORT_BIT = BIT3;
+static modem_dce_t *ppp_dce = NULL;
+int32_t LTE_RSSI = 99;
+uint32_t temperature = 0;
 
 #if CONFIG_EXAMPLE_SEND_MSG
 /**
@@ -131,19 +145,62 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 {
     esp_mqtt_client_handle_t client = event->client;
     int msg_id;
+    char devidstr[17];
+    char onlinetopic[50] = {'\0'};
     switch (event->event_id) {
     case MQTT_EVENT_CONNECTED:
+        work_upgrade_led_stop();
+        work_offline_led_stop();
+        work_online_led_blink();
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/esp-pppos", 0);
+        /* /dev/【设备ID】/upgrade */
+        memset(devidstr, 0, sizeof(devidstr));
+        puthex((uint8_t *)devidstr, stDevice_Info.devid, 8);
+        sprintf(onlinetopic, "/dev/%s/upgrade", devidstr);
+        msg_id = esp_mqtt_client_subscribe(client, onlinetopic, 0);
         ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
         break;
     case MQTT_EVENT_DISCONNECTED:
+        work_upgrade_led_stop();
+        work_online_led_stop();
+        work_offline_led_blink();
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        esp_restart();
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-        msg_id = esp_mqtt_client_publish(client, "/topic/esp-pppos", "esp32-pppos", 0, 0, 0);
-        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+        /*{
+          "device_id":"202106150001",
+          "version":"V1.0"      // 设备当前固件版本号
+          "IMEI":"1234567890"   // 国际移动设备识别码（International Mobile Equipment Identity)
+          "IMSI":"1234567890"   // 国际移动用户识别码（International Mobile Subscriber Identity）
+          "ICCID":"1234567890"  // SIM卡卡号 (Integrate circuit card identity)
+          "GPS":"116.403981,39.915101" // 全球定位坐标
+        }*/
+        /*/dev/【设备ID】/online*/
+        memset(devidstr, 0, sizeof(devidstr));
+        puthex((uint8_t *)devidstr, stDevice_Info.devid, 8);
+        cJSON *root = NULL;
+        root = cJSON_CreateObject();
+        //cJSON_AddStringToObject(root, "device_id", devidstr);
+        const esp_app_desc_t *app_desc = esp_ota_get_app_description();
+        cJSON_AddStringToObject(root, "version", app_desc->version);
+        cJSON_AddStringToObject(root, "IMEI", ppp_dce->imei);
+        cJSON_AddStringToObject(root, "IMSI", ppp_dce->imsi);
+        cJSON_AddStringToObject(root, "ICCID", ppp_dce->iccid);
+        cJSON_AddStringToObject(root, "GPS", ppp_dce->location);
+        cJSON_AddNumberToObject(root, "RSSI", LTE_RSSI);
+
+        char *out = cJSON_Print(root);
+        sprintf(onlinetopic, "/dev/%s/online", devidstr);
+        ESP_LOGI(TAG, "Online topic = %s, message = %s", onlinetopic, out);
+        msg_id = esp_mqtt_client_publish(client, onlinetopic, out, 0, 2, 0);
+        ESP_LOGI(TAG, "sent publish online message successful, msg_id=%d", msg_id);
+        free(out);
+        cJSON_Delete(root);
+
+        //extern void upgradeto(const char* version);
+        //upgradeto("2.0");
         break;
     case MQTT_EVENT_UNSUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
@@ -214,6 +271,27 @@ static void on_ip_event(void *arg, esp_event_base_t event_base,
 
 void app_main(void)
 {
+    const esp_app_desc_t *app_desc = esp_ota_get_app_description();
+    ESP_LOGI(TAG, "fireware version is %s", app_desc->version);
+    // Initialize NVS.
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // 1.OTA app partition table has a smaller NVS partition size than the non-OTA
+        // partition table. This size mismatch may cause NVS initialization to fail.
+        // 2.NVS partition contains data in new format and cannot be recognized by this version of code.
+        // If this happens, we erase NVS partition and initialize NVS again.
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    getdevinfo();
+    getworkpragma();
+    inputio_init();
+    led_poweron();
+    work_offline_led_blink();
+    xTaskCreate(&flow_meter_task, "flow_meter_task", 8192, NULL, 5, NULL);
+    xTaskCreate(&input_io_task, "input_io_task", 4096, NULL, 5, NULL);
+    extern void simple_ota_example_task(void *pvParameter);
+    xTaskCreate(&simple_ota_example_task, "ota_example_task", 4096, NULL, 5, NULL);
 #if CONFIG_LWIP_PPP_PAP_SUPPORT
     esp_netif_auth_type_t auth_type = NETIF_PPP_AUTHTYPE_PAP;
 #elif CONFIG_LWIP_PPP_CHAP_SUPPORT
@@ -270,15 +348,37 @@ void app_main(void)
         assert(dce != NULL);
         ESP_ERROR_CHECK(dce->set_flow_ctrl(dce, MODEM_FLOW_CONTROL_NONE));
         ESP_ERROR_CHECK(dce->store_profile(dce));
+        ppp_dce = dce;
         /* Print Module ID, Operator, IMEI, IMSI */
         ESP_LOGI(TAG, "Module: %s", dce->name);
         ESP_LOGI(TAG, "Operator: %s", dce->oper);
         ESP_LOGI(TAG, "IMEI: %s", dce->imei);
         ESP_LOGI(TAG, "IMSI: %s", dce->imsi);
+        ESP_LOGI(TAG, "ICCID: %s", dce->iccid);
+        ESP_LOGI(TAG, "GPS: %s", dce->location);
         /* Get signal quality */
         uint32_t rssi = 0, ber = 0;
         ESP_ERROR_CHECK(dce->get_signal_quality(dce, &rssi, &ber));
-        ESP_LOGI(TAG, "rssi: %d, ber: %d", rssi, ber);
+        switch(rssi)
+        {
+            case 0:
+                LTE_RSSI = -113;
+                break;
+            case 1:
+                LTE_RSSI = -111;
+                break;
+            case 32:
+                LTE_RSSI = -51;
+                break;
+            case 99:
+                LTE_RSSI = 99;
+                break;
+            default:
+                LTE_RSSI = (int32_t)rssi * 2 - 113 ;
+                break;
+        }
+        ESP_LOGI(TAG, "rssi: %d, ber: %d", LTE_RSSI, ber);
+
         /* Get battery voltage */
         uint32_t voltage = 0, bcs = 0, bcl = 0;
         ESP_ERROR_CHECK(dce->get_battery_status(dce, &bcs, &bcl, &voltage));
@@ -291,15 +391,126 @@ void app_main(void)
         esp_netif_attach(esp_netif, modem_netif_adapter);
         /* Wait for IP address */
         xEventGroupWaitBits(event_group, CONNECT_BIT, pdTRUE, pdTRUE, portMAX_DELAY);
-
+        ip_addr_t dnsaddr;
+        ip4addr_aton("114.114.114.114", &dnsaddr.u_addr.ip4);
+        dns_setserver(1, &dnsaddr);
+        TickType_t readserialwhilewaittime;
+        if(ip4addr_aton((char const*)stWork_Pragma.stRemote_IP.hostname, &stWork_Pragma.stRemote_IP.remoteip.u_addr.ip4) == 0)
+        {
+            ip4_addr_set_u32(&stWork_Pragma.stRemote_IP.remoteip.u_addr.ip4, IPADDR_ANY);
+            while(ip4_addr_get_u32(&stWork_Pragma.stRemote_IP.remoteip.u_addr.ip4) == IPADDR_ANY)
+            {
+                get_remote_ip();
+                readserialwhilewaittime = GetCurrentTime();
+                while(TimerGetElapsedTime(readserialwhilewaittime) < (pdMS_TO_TICKS(2 * 1000)))
+                {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+        }
+        char devidstr[17];
+        char onlinetopic[50] = {'\0'};
+        /*/dev/【设备ID】/update*/
+        memset(devidstr, 0, sizeof(devidstr));
+        puthex((uint8_t *)devidstr, stDevice_Info.devid, 8);
+        static char host[IP4ADDR_STRLEN_MAX] = {0};
+        strcpy(host, ipaddr_ntoa(&stWork_Pragma.stRemote_IP.remoteip));
         /* Config MQTT */
         esp_mqtt_client_config_t mqtt_config = {
-            .uri = BROKER_URL,
+            .uri = NULL,
+            .host = host,
+            .port = stWork_Pragma.stRemote_IP.remoteport,
             .event_handle = mqtt_event_handler,
+            .username = "18701872013",
+            .password = "mawei19870125",
         };
+        static char willtopic[50] = {'\0'};
+        sprintf(willtopic, "/dev/%s/offline", devidstr);
+        cJSON *root_offline_msg = NULL;
+        root_offline_msg = cJSON_CreateObject();
+        cJSON_AddStringToObject(root_offline_msg, "code", "timeout");
+        mqtt_config.lwt_msg = cJSON_Print(root_offline_msg);
+        //free(out);
+        cJSON_Delete(root_offline_msg);
+        mqtt_config.lwt_qos = 2;
+        mqtt_config.lwt_topic = willtopic;
+        //mqtt_config.lwt_msg = willmsg;
+        mqtt_config.lwt_retain = 0;
+        mqtt_config.lwt_msg_len = strlen(mqtt_config.lwt_msg);
+        mqtt_config.disable_clean_session = pdFALSE;
+        mqtt_config.keepalive = 120;
+        mqtt_config.disable_auto_reconnect = pdTRUE;
+        mqtt_config.reconnect_timeout_ms = 0;
+        ESP_LOGI(TAG, "host: %s\nwilltopic: %s\nwillmsg: %s\n", host, willtopic, mqtt_config.lwt_msg);
         esp_mqtt_client_handle_t mqtt_client = esp_mqtt_client_init(&mqtt_config);
         esp_mqtt_client_start(mqtt_client);
-        xEventGroupWaitBits(event_group, GOT_DATA_BIT, pdTRUE, pdTRUE, portMAX_DELAY);
+
+        while(pdTRUE)
+        {
+            EventBits_t uxBits = xEventGroupWaitBits(event_group, DATA_REPORT_BIT | STOP_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+            if( ( uxBits & STOP_BIT ) != 0 )
+            {
+                // xEventGroupWaitBits() returned because just STOP_BIT was set.
+                esp_restart();
+            }
+            else//if( ( uxBits & DATA_REPORT_BIT ) != 0 )
+            {
+                // xEventGroupWaitBits() returned because just DATA_REPORT_BIT was set.
+                /*{
+                  "device_id":"202106150001", // 采集设备的ID
+                  "data":{
+                   "port1":true, // 该采集设备端口1所接设备的运行状态，true：启动；false：停止
+                   "port2":false,
+                   "port3":false,
+                   "port4":true,
+                   "port5":true,
+                   "port6":false,
+                   "port7":false,
+                   "port8":true,
+                   "port9":true,
+                   "port10":false,
+                   "port11":false,
+                   "port12":true,
+                   "flow_rate":1.0, // 流量计的瞬时流量
+                   "flow_total":1.0, // 流量计的正向累计总量
+                   "time":"2020-06-28 17:00:00"
+                  }
+                 }*/
+                cJSON *root = NULL;
+                //cJSON *data = NULL;
+                root = cJSON_CreateObject();
+                //cJSON_AddStringToObject(root, "device_id", devidstr);
+                //cJSON_AddItemToObject(root, "data", data = cJSON_CreateObject());
+                unsigned short io_value = input_pin_read();
+                float flow_rate = 0;
+                double flow_total = 0;
+                flow_meter_data_get(&flow_rate, &flow_total);
+                cJSON_AddBoolToObject(root, "port1", (io_value & (0x0001 << 0))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port2", (io_value & (0x0001 << 1))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port3", (io_value & (0x0001 << 2))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port4", (io_value & (0x0001 << 3))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port5", (io_value & (0x0001 << 4))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port6", (io_value & (0x0001 << 5))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port7", (io_value & (0x0001 << 6))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port8", (io_value & (0x0001 << 7))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port9", (io_value & (0x0001 << 8))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port10", (io_value & (0x0001 << 9))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port11", (io_value & (0x0001 << 10))?pdTRUE:pdFALSE);
+                cJSON_AddBoolToObject(root, "port12", (io_value & (0x0001 << 11))?pdTRUE:pdFALSE);
+                cJSON_AddNumberToObject(root, "flow_rate", flow_rate);
+                cJSON_AddNumberToObject(root, "flow_total", flow_total);
+                //cJSON_AddNumberToObject(root, "temperature", temperature);
+                char *out = cJSON_Print(root);
+                sprintf(onlinetopic, "/dev/%s/update", devidstr);
+                ESP_LOGI(TAG, "Report topic = %s, message = %s", onlinetopic, out);
+                int msg_id = esp_mqtt_client_publish(mqtt_client, onlinetopic, out, 0, 2, 0);
+                ESP_LOGI(TAG, "sent publish message successful, msg_id=%d", msg_id);
+                free(out);
+                cJSON_Delete(root);
+                data_report_led_blink();
+            }
+        }
+
         esp_mqtt_client_destroy(mqtt_client);
 
         /* Exit PPP mode */
@@ -319,6 +530,7 @@ void app_main(void)
         ESP_LOGI(TAG, "Restart after 60 seconds");
         vTaskDelay(pdMS_TO_TICKS(60000));
     }
+
 
     /* Unregister events, destroy the netif adapter and destroy its esp-netif instance */
     esp_modem_netif_clear_default_handlers(modem_netif_adapter);

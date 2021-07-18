@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "bg96.h"
 #include "bg96_private.h"
+#include "driver/gpio.h"
 
 #define MODEM_RESULT_CODE_POWERDOWN "POWERED DOWN"
 
@@ -104,7 +105,7 @@ static esp_err_t bg96_handle_cgmm(modem_dce_t *dce, const char *line)
     } else if (strstr(line, MODEM_RESULT_CODE_ERROR)) {
         err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
     } else {
-        int len = snprintf(dce->name, MODEM_MAX_NAME_LENGTH, "%s", line);
+        int len = snprintf(dce->name, MODEM_MAX_NAME_LENGTH, "%s", line + 7);
         if (len > 2) {
             /* Strip "\r\n" */
             strip_cr_lf_tail(dce->name, len);
@@ -157,11 +158,33 @@ static esp_err_t bg96_handle_cimi(modem_dce_t *dce, const char *line)
 }
 
 /**
+ * @brief Handle response from AT+CIMI
+ */
+static esp_err_t bg96_handle_iccid(modem_dce_t *dce, const char *line)
+{
+    esp_err_t err = ESP_FAIL;
+    if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
+        err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+    } else if (strstr(line, MODEM_RESULT_CODE_ERROR)) {
+        err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
+    } else {
+        int len = snprintf(dce->iccid, MODEM_ICCID_LENGTH + 1, "%s", line);
+        if (len > 2) {
+            /* Strip "\r\n" */
+            strip_cr_lf_tail(dce->iccid, len);
+            err = ESP_OK;
+        }
+    }
+    return err;
+}
+
+/**
  * @brief Handle response from AT+COPS?
  */
 static esp_err_t bg96_handle_cops(modem_dce_t *dce, const char *line)
 {
     esp_err_t err = ESP_FAIL;
+    printf("################## %s, %s\n", __func__, line);
     if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
         err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
     } else if (strstr(line, MODEM_RESULT_CODE_ERROR)) {
@@ -231,6 +254,7 @@ static esp_err_t bg96_get_signal_quality(modem_dce_t *dce, uint32_t *rssi, uint3
     DCE_CHECK(dte->send_cmd(dte, "AT+CSQ\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
     DCE_CHECK(dce->state == MODEM_STATE_SUCCESS, "inquire signal quality failed", err);
     ESP_LOGD(DCE_TAG, "inquire signal quality ok");
+    vTaskDelay(100 / portTICK_RATE_MS);
     return ESP_OK;
 err:
     return ESP_FAIL;
@@ -249,17 +273,19 @@ err:
  */
 static esp_err_t bg96_get_battery_status(modem_dce_t *dce, uint32_t *bcs, uint32_t *bcl, uint32_t *voltage)
 {
+    /*
     modem_dte_t *dte = dce->dte;
     bg96_modem_dce_t *bg96_dce = __containerof(dce, bg96_modem_dce_t, parent);
     uint32_t *resource[3] = {bcs, bcl, voltage};
     bg96_dce->priv_resource = resource;
     dce->handle_line = bg96_handle_cbc;
-    DCE_CHECK(dte->send_cmd(dte, "AT+CBC\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+    DCE_CHECK(dte->send_cmd(dte, "AT+CBC\r\n", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
     DCE_CHECK(dce->state == MODEM_STATE_SUCCESS, "inquire battery status failed", err);
     ESP_LOGD(DCE_TAG, "inquire battery status ok");
     return ESP_OK;
 err:
-    return ESP_FAIL;
+    return ESP_FAIL;*/
+    return ESP_OK;
 }
 
 /**
@@ -396,6 +422,230 @@ err:
 }
 
 /**
+ * @brief Get DCE module IMSI number
+ *
+ * @param bg96_dce bg96 object
+ * @return esp_err_t
+ *      - ESP_OK on success
+ *      - ESP_FAIL on error
+ */
+static esp_err_t bg96_get_iccid_number(bg96_modem_dce_t *bg96_dce)
+{
+    modem_dte_t *dte = bg96_dce->parent.dte;
+    bg96_dce->parent.handle_line = bg96_handle_iccid;
+    DCE_CHECK(dte->send_cmd(dte, "AT+CCID\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+    DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "get iccid number failed", err);
+    ESP_LOGD(DCE_TAG, "get iccid number ok");
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
+static esp_err_t bg96_set_lbs_type(bg96_modem_dce_t *bg96_dce)
+{
+    modem_dte_t *dte = bg96_dce->parent.dte;
+    bg96_dce->parent.handle_line = esp_modem_dce_handle_response_default;
+    DCE_CHECK(dte->send_cmd(dte, "AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+    DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set lbs type failed", err);
+    ESP_LOGD(DCE_TAG, "set lbs type ok");
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
+static bool strisgps(char* str)
+{
+    for(int loop = 0; loop < strlen(str); loop ++)
+    {
+        if(!str[loop])
+        {
+            break;
+        }
+        else
+        {
+            if(((str[loop] < '0') && (str[loop] != '.')) || ((str[loop] > '9') && (str[loop] != '.')))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+static esp_err_t bg96_handle_gps(modem_dce_t *dce, const char *line)
+{
+    esp_err_t err = ESP_FAIL;
+    static bool gpsgot = false;
+    if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
+        if(gpsgot)
+        {
+            gpsgot = false;
+            err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+        }
+    } else if (strstr(line, MODEM_RESULT_CODE_ERROR)) {
+        if(!strstr(line, "+CME ERROR:"))
+        {
+            err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
+        }
+    } else if (!strncmp(line, "+CIPGSMLOC:", strlen("+CIPGSMLOC:"))) {
+        /* there might be some random spaces in operator's name, we can not use sscanf to parse the result */
+        /* strtok will break the string, we need to create a copy */
+        size_t len = strlen(line);
+        char *line_copy = malloc(len + 1);
+        strcpy(line_copy, line);
+        /* +COPS: <mode>[, <format>[, <oper>]] */
+        char *str_ptr = NULL;
+        char *p[5];
+        uint8_t i = 0;
+        /* strtok will broke string by replacing delimiter with '\0' */
+        p[i] = strtok_r(line_copy, ",", &str_ptr);
+        while (p[i]) {
+            p[++i] = strtok_r(NULL, ",", &str_ptr);
+        }
+        if (i >= 5) {
+            int len;
+            if((strisgps(p[1]) == false) || (strisgps(p[2]) == false))
+            {
+                return ESP_FAIL;
+            }
+            len = snprintf(dce->location, MODEM_GPS_LENGTH, "%s", p[2]);
+            if (len > 2) {
+                /* Strip "\r\n" */
+                strip_cr_lf_tail(dce->location, len);
+                err = ESP_OK;
+            }
+            len += snprintf(dce->location + len, MODEM_GPS_LENGTH - len, "%s", ",");
+            if (len > 2) {
+                /* Strip "\r\n" */
+                strip_cr_lf_tail(dce->location, len);
+                err = ESP_OK;
+            }
+            len += snprintf(dce->location + len, MODEM_GPS_LENGTH - len, "%s", p[1]);
+            if (len > 2) {
+                /* Strip "\r\n" */
+                strip_cr_lf_tail(dce->location, len);
+                err = ESP_OK;
+            }
+            gpsgot = true;
+        }
+        free(line_copy);
+    }
+    return err;
+}
+
+static esp_err_t bg96_handle_ip(modem_dce_t *dce, const char *line)
+{
+    esp_err_t err = ESP_FAIL;
+    static bool ipgot = false;
+    if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
+        if(ipgot)
+        {
+            ipgot = false;
+            err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+        }
+    } else if (strstr(line, MODEM_RESULT_CODE_ERROR)) {
+        if(!strstr(line, "+CME ERROR:"))
+        {
+            err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
+        }
+    } else if (!strncmp(line, "+SAPBR:", strlen("+SAPBR:"))) {
+        /* there might be some random spaces in operator's name, we can not use sscanf to parse the result */
+        /* strtok will break the string, we need to create a copy */
+        size_t len = strlen(line);
+        char *line_copy = malloc(len + 1);
+        strcpy(line_copy, line);
+        /* +COPS: <mode>[, <format>[, <oper>]] */
+        char *str_ptr = NULL;
+        char *p[3];
+        uint8_t i = 0;
+        /* strtok will broke string by replacing delimiter with '\0' */
+        p[i] = strtok_r(line_copy, ",", &str_ptr);
+        while (p[i]) {
+            p[++i] = strtok_r(NULL, ",", &str_ptr);
+        }
+        if (i >= 3) {
+            ip_addr_t pppip;
+            char ip[IP4ADDR_STRLEN_MAX + 1] = {0};
+            p[2][strlen(p[2]) - 2] = '\0';
+            memset(ip, 0, sizeof(ip));
+            memcpy(ip, p[2] + 1, strlen(p[2]) - 2);
+            ip4_addr_set_u32(&pppip.u_addr.ip4, IPADDR_ANY);
+            ip4addr_aton(ip, &pppip.u_addr.ip4);
+            if(ip4_addr_get_u32(&pppip.u_addr.ip4) == IPADDR_ANY)
+            {
+                //err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
+                //err = ESP_FAIL;
+            }
+            else
+            {
+                ipgot = true;
+            }
+        }
+        free(line_copy);
+    }
+    return err;
+}
+
+static esp_err_t bg96_set_lbs_apn(bg96_modem_dce_t *bg96_dce)
+{
+    modem_dte_t *dte = bg96_dce->parent.dte;
+    static char cmdstr[250] = {0};
+    memset(cmdstr, 0, sizeof(cmdstr));
+    bg96_dce->parent.handle_line = esp_modem_dce_handle_response_default;
+
+    /*if(strlen((const char *)stWork_Pragma.stModem_Pragma.apn) > 0)
+    {
+        snprintf(cmdstr, sizeof(cmdstr) - 1, "AT+SAPBR=3,1,\"APN\",\"%s\",\"USER\",\"%s\",\"PWD\",\"%s\"\r", stWork_Pragma.stModem_Pragma.apn, stWork_Pragma.stModem_Pragma.username, stWork_Pragma.stModem_Pragma.password);
+    }
+    else*/
+    {
+        strcpy(cmdstr, "AT+SAPBR=3,1,\"APN\",\"\"\r");
+    }
+    printf("%s\r\n", cmdstr);
+    DCE_CHECK(dte->send_cmd(dte, cmdstr, MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+    DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set lbs apn failed", err);
+    ESP_LOGD(DCE_TAG, "set lbs apn ok");
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
+static esp_err_t bg96_lbs_active(bg96_modem_dce_t *bg96_dce)
+{
+    modem_dte_t *dte = bg96_dce->parent.dte;
+    bg96_dce->parent.handle_line = esp_modem_dce_handle_response_default;
+    DCE_CHECK(dte->send_cmd(dte, "AT+SAPBR=1,1\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+    DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "active lbs failed", err);
+    ESP_LOGD(DCE_TAG, "active lbs ok");
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
+static esp_err_t bg96_get_gps(bg96_modem_dce_t *bg96_dce)
+{
+    modem_dte_t *dte = bg96_dce->parent.dte;
+    bg96_dce->parent.handle_line = bg96_handle_gps;
+    DCE_CHECK(dte->send_cmd(dte, "AT+CIPGSMLOC=1,1\r", MODEM_COMMAND_TIMEOUT_GET_GPS) == ESP_OK, "send command failed", err);
+    DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "get gps failed", err);
+    ESP_LOGD(DCE_TAG, "get gps ok");
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
+static esp_err_t bg96_get_ip(bg96_modem_dce_t *bg96_dce)
+{
+    modem_dte_t *dte = bg96_dce->parent.dte;
+    bg96_dce->parent.handle_line = bg96_handle_ip;
+    DCE_CHECK(dte->send_cmd(dte, "AT+SAPBR=2,1\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+    DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "get ip failed", err);
+    ESP_LOGD(DCE_TAG, "get ip ok");
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
+/**
  * @brief Get Operator's name
  *
  * @param dce Modem DCE object
@@ -434,8 +684,59 @@ static esp_err_t bg96_deinit(modem_dce_t *dce)
     return ESP_OK;
 }
 
+void modem_gpio_init(void)
+{
+    /* rst pin */
+    gpio_config_t io_conf;
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = (1ULL<<15);
+    //disable pull-down mode
+    io_conf.pull_down_en = 0;
+    //disable pull-up mode
+    io_conf.pull_up_en = 1;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+    gpio_set_level(15, 1);
+
+    /* pwk pin */
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = (1ULL<<2);
+    //disable pull-down mode
+    io_conf.pull_down_en = 0;
+    //disable pull-up mode
+    io_conf.pull_up_en = 1;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+    gpio_set_level(2, 0);
+    vTaskDelay(50 / portTICK_RATE_MS);
+}
+
+void modem_power_on(void)
+{
+    /* reset */
+    vTaskDelay(100 / portTICK_RATE_MS);
+    gpio_set_level(15, 1);
+    vTaskDelay(50 / portTICK_RATE_MS);
+    gpio_set_level(15, 0);
+    vTaskDelay(100 / portTICK_RATE_MS);
+    /* pwk */
+    gpio_set_level(2, 1);
+    vTaskDelay(2100 / portTICK_RATE_MS);
+    gpio_set_level(2, 0);
+    vTaskDelay(2100 / portTICK_RATE_MS);
+}
+
 modem_dce_t *bg96_init(modem_dte_t *dte)
 {
+    int ppptrycnt = 0;
     DCE_CHECK(dte, "DCE should bind with a DTE", err);
     /* malloc memory for bg96_dce object */
     bg96_modem_dce_t *bg96_dce = calloc(1, sizeof(bg96_modem_dce_t));
@@ -457,18 +758,39 @@ modem_dce_t *bg96_init(modem_dte_t *dte)
     bg96_dce->parent.set_working_mode = bg96_set_working_mode;
     bg96_dce->parent.power_down = bg96_power_down;
     bg96_dce->parent.deinit = bg96_deinit;
+    modem_gpio_init();
+    ppptrycnt = 0;
+    modem_power_on();
+    DCE_CHECK(esp_modem_dce_sync(&(bg96_dce->parent)) == ESP_OK, "sync failed", sync);
+sync:
+    ppptrycnt ++;
+    if(ppptrycnt > 15)
+    {
+        esp_restart();
+    }
+    //vTaskDelay(10000 / portTICK_RATE_MS);
     /* Sync between DTE and DCE */
-    DCE_CHECK(esp_modem_dce_sync(&(bg96_dce->parent)) == ESP_OK, "sync failed", err_io);
+    DCE_CHECK(esp_modem_dce_sync(&(bg96_dce->parent)) == ESP_OK, "sync failed", sync);
     /* Close echo */
-    DCE_CHECK(esp_modem_dce_echo(&(bg96_dce->parent), false) == ESP_OK, "close echo mode failed", err_io);
+    DCE_CHECK(esp_modem_dce_echo(&(bg96_dce->parent), false) == ESP_OK, "close echo mode failed", sync);
     /* Get Module name */
-    DCE_CHECK(bg96_get_module_name(bg96_dce) == ESP_OK, "get module name failed", err_io);
+    DCE_CHECK(bg96_get_module_name(bg96_dce) == ESP_OK, "get module name failed", sync);
+    vTaskDelay(100 / portTICK_RATE_MS);
     /* Get IMEI number */
-    DCE_CHECK(bg96_get_imei_number(bg96_dce) == ESP_OK, "get imei failed", err_io);
+    DCE_CHECK(bg96_get_imei_number(bg96_dce) == ESP_OK, "get imei failed", sync);
     /* Get IMSI number */
-    DCE_CHECK(bg96_get_imsi_number(bg96_dce) == ESP_OK, "get imsi failed", err_io);
+    DCE_CHECK(bg96_get_imsi_number(bg96_dce) == ESP_OK, "get imsi failed", sync);
+    /* Get ICCID number */
+    DCE_CHECK(bg96_get_iccid_number(bg96_dce) == ESP_OK, "get iccid failed", sync);
     /* Get operator name */
     DCE_CHECK(bg96_get_operator_name(&(bg96_dce->parent)) == ESP_OK, "get operator name failed", err_io);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    DCE_CHECK(bg96_set_lbs_type(bg96_dce) == ESP_OK, "set lbs type failed", sync);
+    DCE_CHECK(bg96_set_lbs_apn(bg96_dce) == ESP_OK, "set lbs apn failed", sync);
+    DCE_CHECK(bg96_lbs_active(bg96_dce) == ESP_OK, "set lbs active failed", sync);
+    DCE_CHECK(bg96_get_ip(bg96_dce) == ESP_OK, "get ip failed", sync);
+//get_gps:
+    DCE_CHECK(bg96_get_gps(bg96_dce) == ESP_OK, "get gps failed", sync);
     return &(bg96_dce->parent);
 err_io:
     free(bg96_dce);

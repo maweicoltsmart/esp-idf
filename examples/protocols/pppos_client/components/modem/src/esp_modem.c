@@ -234,7 +234,7 @@ static void uart_event_task_entry(void *param)
         esp_event_loop_run(esp_dte->event_loop_hdl, pdMS_TO_TICKS(0));
 
         /* Process UART events */
-        if (xQueueReceive(esp_dte->event_queue, &event, pdMS_TO_TICKS(100))) {
+        if (xQueueReceive(esp_dte->event_queue, &event, pdMS_TO_TICKS(10))) {
             if (esp_dte->parent.dce == NULL) {
                 ESP_LOGD(MODEM_TAG, "Ignore UART event for DTE with no DCE attached");
                 // No action on any uart event with null DCE.
@@ -500,7 +500,7 @@ modem_dte_t *esp_modem_dte_init(const esp_modem_dte_config_t *config)
     MODEM_CHECK(res == ESP_OK, "config uart flow control failed", err_uart_config);
     /* Install UART driver and get event queue used inside driver */
     res = uart_driver_install(esp_dte->uart_port, config->rx_buffer_size, config->tx_buffer_size,
-                              config->event_queue_size, &(esp_dte->event_queue), 0);
+                              config->event_queue_size, &(esp_dte->event_queue), ESP_INTR_FLAG_IRAM);
     MODEM_CHECK(res == ESP_OK, "install uart driver failed", err_uart_config);
     res = uart_set_rx_timeout(esp_dte->uart_port, 1);
     MODEM_CHECK(res == ESP_OK, "set rx timeout failed", err_uart_config);

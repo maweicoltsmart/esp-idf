@@ -81,16 +81,16 @@ typedef esp_err_t (*esp_modem_on_receive)(void *buffer, size_t len, void *contex
         .parity = UART_PARITY_DISABLE,          \
         .baud_rate = 115200,                    \
         .flow_control = MODEM_FLOW_CONTROL_NONE,\
-        .tx_io_num = 25,                        \
-        .rx_io_num = 26,                        \
+        .tx_io_num = 5,                        \
+        .rx_io_num = 13,                        \
         .rts_io_num = 27,                       \
         .cts_io_num = 23,                       \
-        .rx_buffer_size = 1024,                 \
-        .tx_buffer_size = 512,                  \
+        .rx_buffer_size = (300 * 1024),               \
+        .tx_buffer_size = (4 * 1024),                  \
         .pattern_queue_size = 20,               \
         .event_queue_size = 30,                 \
         .event_task_stack_size = 2048,          \
-        .event_task_priority = 5,               \
+        .event_task_priority = 100,             \
         .line_buffer_size = 512                 \
     }
 
